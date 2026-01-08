@@ -43,11 +43,11 @@ type ProgressTracker struct {
 	modelName  string // Model name for header
 
 	// Track state per task for in-place updates
-	taskStates   map[int]*taskState // key = task.Index
-	totalLines   int                // Total lines currently displayed
-	taskOrder    []int              // Order of tasks as they appear on screen
-	spinnerTick  chan struct{}      // Ticker for spinner animation
-	stopSpinner  chan struct{}      // Stop signal for spinner
+	taskStates  map[int]*taskState // key = task.Index
+	totalLines  int                // Total lines currently displayed
+	taskOrder   []int              // Order of tasks as they appear on screen
+	spinnerTick chan struct{}      // Ticker for spinner animation
+	stopSpinner chan struct{}      // Stop signal for spinner
 }
 
 // NewProgressTracker creates a new progress tracker
@@ -261,6 +261,36 @@ func (p *ProgressTracker) TaskProviderError(providerErr ProviderError) {
 	p.renderAll()
 }
 
+// Backoff displays a short banner explaining that the scheduler is pausing
+func (p *ProgressTracker) Backoff(delay time.Duration, reason string) {
+	message := fmt.Sprintf("[BACKOFF] Pausing for %.1fs", delay.Seconds())
+	if reason != "" {
+		message = fmt.Sprintf("%s (%s)", message, reason)
+	}
+
+	if !p.enabled {
+		fmt.Fprintln(p.out, message)
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Temporarily clear current display
+	if p.totalLines > 0 {
+		for i := 0; i < p.totalLines; i++ {
+			fmt.Fprintf(p.out, "\033[1A")
+		}
+		fmt.Fprintf(p.out, "\r")
+		fmt.Fprintf(p.out, "\033[J")
+	}
+
+	fmt.Fprintln(p.out, message)
+
+	// Re-render after banner
+	p.renderAll()
+}
+
 // Finish displays the final summary
 func (p *ProgressTracker) Finish(summary VolleySummary) {
 	if !p.enabled {
@@ -309,7 +339,6 @@ func formatTokens(tokens int64) string {
 	}
 	return fmt.Sprintf("%d", tokens)
 }
-
 
 // renderAll renders all tasks and their tool traces, updating in place
 func (p *ProgressTracker) renderAll() {

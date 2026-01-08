@@ -27,7 +27,7 @@ type TaskResult struct {
 	Cost         float64
 	Retries      int
 	WorkerID     int
-	Model        string // Model ID used for this task
+	Model        string                     // Model ID used for this task
 	ToolMetadata []*tools.ExecutionMetadata // Tool execution metadata
 }
 
@@ -52,6 +52,9 @@ type VolleyOptions struct {
 
 	// MaxRetries is the maximum number of retry attempts per task
 	MaxRetries int
+
+	// TaskTimeout limits per-task execution time (0 = no timeout)
+	TaskTimeout time.Duration
 
 	// ShowProgress enables live progress output to stderr
 	ShowProgress bool
@@ -85,6 +88,15 @@ type VolleyOptions struct {
 
 	// EmitToolTrace enables NDJSON tool trace output to stderr
 	EmitToolTrace bool
+
+	// StreamResults streams task output as soon as each task finishes
+	StreamResults bool
+
+	// ResultHandler is invoked as soon as a task finishes (if set)
+	ResultHandler func(TaskResult)
+
+	// BackoffBaseDelay sets the pause duration when backing off after failures
+	BackoffBaseDelay time.Duration
 }
 
 // DefaultVolleyOptions returns sensible defaults
@@ -92,6 +104,7 @@ func DefaultVolleyOptions() VolleyOptions {
 	return VolleyOptions{
 		MaxConcurrent:    3, // Conservative default
 		MaxRetries:       3,
+		TaskTimeout:      0,
 		ShowProgress:     true, // Show progress by default
 		ShowSummary:      false,
 		OutputFormat:     "text",
@@ -99,21 +112,22 @@ func DefaultVolleyOptions() VolleyOptions {
 		Estimate:         false,
 		SkipConfirmation: false,
 		Verbosity:        config.VerbosityNormal, // Show tool traces by default
+		BackoffBaseDelay: 5 * time.Second,
 	}
 }
 
 // VolleySummary contains aggregate results from a volley execution
 type VolleySummary struct {
-	TotalTasks       int
-	SucceededTasks   int
-	FailedTasks      int
-	CanceledTasks    int
-	Duration         time.Duration
-	TotalTokens      int64
-	TotalCost        float64
-	AvgTokensPerTask int64
+	TotalTasks        int
+	SucceededTasks    int
+	FailedTasks       int
+	CanceledTasks     int
+	Duration          time.Duration
+	TotalTokens       int64
+	TotalCost         float64
+	AvgTokensPerTask  int64
 	MaxConcurrentUsed int
-	TotalRetries     int
+	TotalRetries      int
 }
 
 // Usage represents token usage for a task

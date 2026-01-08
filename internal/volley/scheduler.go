@@ -2,6 +2,7 @@ package volley
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -39,10 +40,16 @@ type Scheduler struct {
 	currentConcurrent int // Current number of active workers
 	successCount      int // Consecutive successful tasks (reset on failure)
 	failureCount      int // Consecutive failed tasks (reset on success)
+	lastErrorClass    ErrorClass
 
 	// Results tracking
 	results     []TaskResult
 	resultsChan chan TaskResult
+
+	// Backoff coordination
+	backoffUntil    time.Time
+	backoffReason   string
+	backoffAnnounce bool
 }
 
 // NewScheduler creates a new scheduler
@@ -54,7 +61,6 @@ func NewScheduler(cfg *config.Config, ag agent.Service, store *message.Store, op
 		options:      opts,
 		progress:     NewProgressTracker(opts.ShowProgress),
 		results:      make([]TaskResult, 0),
-		resultsChan:  make(chan TaskResult, opts.MaxConcurrent*2),
 	}
 }
 
@@ -78,6 +84,9 @@ func (s *Scheduler) Execute(ctx context.Context, tasks []Task) ([]TaskResult, Vo
 	// Set model name on progress tracker
 	modelName := formatModel(s.agent.Model().ID)
 	s.progress.SetModel(modelName)
+
+	// Resize results channel to the volley size to avoid backpressure
+	s.resultsChan = make(chan TaskResult, len(tasks))
 
 	// Start progress tracker
 	s.progress.Start(len(tasks), s.options.MaxConcurrent)
@@ -131,6 +140,11 @@ func (s *Scheduler) Execute(ctx context.Context, tasks []Task) ([]TaskResult, Vo
 // worker processes tasks from the queue
 func (s *Scheduler) worker(ctx context.Context, workerID int, taskQueue <-chan Task) {
 	for {
+		if s.maybeBackoff(ctx) {
+			// Backoff handled sleep or cancellation; continue to next loop
+			continue
+		}
+
 		select {
 		case <-ctx.Done():
 			// Context canceled - drain remaining tasks as canceled
@@ -190,10 +204,28 @@ func (s *Scheduler) executeTask(ctx context.Context, workerID int, task Task) Ta
 
 	startTime := time.Now()
 
+	taskCtx := ctx
+	var cancel func()
+	if s.options.TaskTimeout > 0 {
+		taskCtx, cancel = context.WithTimeout(ctx, s.options.TaskTimeout)
+		defer cancel()
+	}
+
 	// Try executing with retries
 	var lastErr error
 	var lastOutput string
 	for attempt := 0; attempt <= s.options.MaxRetries; attempt++ {
+		if err := taskCtx.Err(); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) && s.options.TaskTimeout > 0 {
+				result.Status = TaskStatusFailed
+				result.Error = fmt.Errorf("task timed out after %s", s.options.TaskTimeout)
+			} else {
+				result.Status = TaskStatusCanceled
+				result.Error = err
+			}
+			result.Duration = time.Since(startTime)
+			return result
+		}
 		if attempt > 0 {
 			result.Retries = attempt
 			delay := retryDelayForError(lastErr, attempt)
@@ -202,9 +234,14 @@ func (s *Scheduler) executeTask(ctx context.Context, workerID int, task Task) Ta
 			// Sleep with context awareness for clean cancellation
 			select {
 			case <-time.After(delay):
-			case <-ctx.Done():
-				result.Status = TaskStatusCanceled
-				result.Error = ctx.Err()
+			case <-taskCtx.Done():
+				if errors.Is(taskCtx.Err(), context.DeadlineExceeded) && s.options.TaskTimeout > 0 {
+					result.Status = TaskStatusFailed
+					result.Error = fmt.Errorf("task timed out after %s", s.options.TaskTimeout)
+				} else {
+					result.Status = TaskStatusCanceled
+					result.Error = taskCtx.Err()
+				}
 				result.Duration = time.Since(startTime)
 				return result
 			}
@@ -228,7 +265,7 @@ func (s *Scheduler) executeTask(ctx context.Context, workerID int, task Task) Ta
 		}
 
 		// Execute via agent
-		output, usage, toolMetadata, err := s.executeViaAgent(ctx, prompt, task)
+		output, usage, toolMetadata, err := s.executeViaAgent(taskCtx, prompt, task)
 		lastOutput = output // Save for potential error feedback
 
 		if err != nil {
@@ -249,10 +286,15 @@ func (s *Scheduler) executeTask(ctx context.Context, workerID int, task Task) Ta
 			// Report structured error to progress tracker
 			s.progress.TaskProviderError(providerErr)
 
+			s.mu.Lock()
+			s.lastErrorClass = providerErr.ErrorClass
+			s.mu.Unlock()
+
 			// Check if we should retry
 			if providerErr.IsRetrying {
 				s.mu.Lock()
 				s.failureCount++
+				s.successCount = 0
 				s.mu.Unlock()
 				continue
 			}
@@ -287,6 +329,12 @@ func (s *Scheduler) executeTask(ctx context.Context, workerID int, task Task) Ta
 	result.Status = TaskStatusFailed
 	result.Error = lastErr
 	result.Duration = time.Since(startTime)
+
+	s.mu.Lock()
+	s.failureCount++
+	s.successCount = 0
+	s.lastErrorClass = classifyError(lastErr)
+	s.mu.Unlock()
 
 	s.progress.TaskFailed(task, lastErr, result.Retries)
 
@@ -375,14 +423,17 @@ func (s *Scheduler) executeViaAgent(ctx context.Context, prompt string, task Tas
 // handleResult processes a completed task result
 func (s *Scheduler) handleResult(ctx context.Context, result TaskResult, cancel context.CancelFunc) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Store result
 	s.results[result.Task.Index-1] = result
+	failFast := s.options.FailFast && result.Status == TaskStatusFailed
+	handler := s.options.ResultHandler
+	s.mu.Unlock()
 
-	// Check fail-fast
-	if s.options.FailFast && result.Status == TaskStatusFailed {
+	if failFast {
 		cancel()
+	}
+
+	if handler != nil {
+		handler(result)
 	}
 }
 
@@ -399,6 +450,61 @@ func (s *Scheduler) getHealthMetrics() (successCount, failureCount, currentConcu
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.successCount, s.failureCount, s.currentConcurrent
+}
+
+// maybeBackoff pauses new work when the scheduler detects consecutive failures.
+// Returns true if a backoff was applied (or context cancelled), false otherwise.
+func (s *Scheduler) maybeBackoff(ctx context.Context) bool {
+	// No backoff configured
+	if s.options.BackoffBaseDelay <= 0 {
+		return false
+	}
+
+	s.mu.Lock()
+	now := time.Now()
+	remaining := time.Duration(0)
+	announce := false
+	reason := s.backoffReason
+
+	// If already backing off, continue waiting for the existing window
+	if now.Before(s.backoffUntil) {
+		remaining = time.Until(s.backoffUntil)
+		announce = !s.backoffAnnounce
+		s.backoffAnnounce = true
+	} else if s.failureCount >= 3 && s.successCount == 0 {
+		remaining = s.options.BackoffBaseDelay
+		s.backoffUntil = now.Add(remaining)
+		reason = errorClassName(s.lastErrorClass)
+		s.backoffReason = reason
+		announce = true
+		s.backoffAnnounce = true
+		// Reset counters so we don't repeatedly back off without new signals
+		s.failureCount = 0
+		s.successCount = 0
+	}
+	s.mu.Unlock()
+
+	if remaining <= 0 {
+		return false
+	}
+
+	if announce {
+		s.progress.Backoff(remaining, reason)
+	}
+
+	select {
+	case <-time.After(remaining):
+	case <-ctx.Done():
+		return true
+	}
+
+	s.mu.Lock()
+	if time.Now().After(s.backoffUntil) {
+		s.backoffAnnounce = false
+	}
+	s.mu.Unlock()
+
+	return true
 }
 
 // shouldBackoff determines if the scheduler should slow down based on failure rate
@@ -488,6 +594,23 @@ const (
 	ErrorClassAuth                         // Auth errors (401/403) - fatal, no retry
 	ErrorClassValidation                   // Validation errors (400) - fatal, no retry
 )
+
+func errorClassName(class ErrorClass) string {
+	switch class {
+	case ErrorClassRateLimit:
+		return "rate limits"
+	case ErrorClassTimeout:
+		return "timeouts"
+	case ErrorClassNetwork:
+		return "network errors"
+	case ErrorClassAuth:
+		return "auth errors"
+	case ErrorClassValidation:
+		return "validation errors"
+	default:
+		return "multiple failures"
+	}
+}
 
 // classifyError determines the error category for adaptive retry
 //
