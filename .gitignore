@@ -47,6 +47,11 @@ Thumbs.db
 /crush
 /cliffy
 
+.karl/
+
+
 manpages/
 completions/
 !internal/tui/components/completions/
+
+.gocache/
