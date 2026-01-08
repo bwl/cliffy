@@ -1,0 +1,43 @@
+# TLDR Agent Spec v0.1
+
+**TLDR (Too Long; Didn't Read)** is a minimal, parseable command metadata standard for AI agents to discover and use CLIs efficiently.
+
+## Problem Solved
+- Agents struggle with verbose, inconsistent CLI help text
+- High token cost, manual parsing, discovery friction
+
+## Solution
+- `--tldr` flag exposes entire CLI in structured, minimal format
+- ASCII wire format: KEY: value pairs (uppercase, no blanks)
+- Optional JSON mode for same schema
+
+## Key Features
+- Zero-shot discovery: `<cli> --tldr` lists all commands
+- Type-aware: STR, BOOL, INT, FLOAT, FILE, LIST, STDIN flags
+- Self-documenting: Examples, relationships, side effects inline
+- Universal: Language/framework agnostic
+- Minimal tokens: ~2KB for 30-command CLI
+
+## Quick Usage
+```bash
+# Discover commands
+$ <cli> --tldr  # NAME, VERSION, SUMMARY, COMMANDS, TLDR_CALL
+
+# Get command details
+$ <cli> <command> --tldr  # CMD, PURPOSE, INPUTS, OUTPUTS, FLAGS, EXAMPLES, RELATED
+
+# Optional JSON mode
+$ <cli> --tldr=json
+```
+
+## Implementation
+- Add `--tldr` to root and all commands
+- Registry of metadata (see reference-implementations/forest/tldr.ts)
+- Validate with generators: ./scripts/tldr-doc-gen.sh <cli> --validate
+
+## Benefits
+- Agents learn CLI in one round-trip
+- CLI authors get automatic docs and better agent UX
+- Future-proof standard as agents evolve
+
+**TL;DR for humans**: Add `--tldr` to your CLI. Agents will love you. 🤖✨

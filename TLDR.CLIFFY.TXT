@@ -1,0 +1,85 @@
+NAME: cliffy
+VERSION: 0.1.0
+SUMMARY: Fast, headless AI coding assistant for one-off tasks
+COMMANDS: exec,volley,doctor,init,preset.list,preset.show,preset.apply,completion
+TLDR_CALL: cliffy <command> --tldr
+
+CMD: exec
+PURPOSE: Execute one or multiple tasks (parallel via scheduler)
+INPUTS: ARGS(task1,task2,...),STDIN,FILE,ENV(CLIFFY_OPENROUTER_API_KEY)
+OUTPUTS: task results (text|json|diff),optional stats summary
+SIDE_EFFECTS: network,reads project files,optional writes via tools
+FLAGS: --show-thinking=BOOL=false|show LLM reasoning;--thinking-format=STR=text|format for thinking (text|json);--output-format=STR=text|output format (text|json|diff);--model=STR|
+override model type;--fast=BOOL=false|use small/fast model;--smart=BOOL=false|use large/smart model;--stats=BOOL=false|show token usage and timing;--version=BOOL=false|print
+version and exit;--verbose=BOOL=false|detailed tool traces and events;--quiet=BOOL=false|suppress tool traces and progress;--context=STR|shared context prepended to each task;-
+-context-file=FILE|load shared context from file;--emit-tool-trace=BOOL=false|emit tool metadata as NDJSON to stderr;--preset=STR|use preset configuration (e.g., fast-qa,
+sec-review);--max-concurrent=INT=0|max parallel tasks (0=use config default, default ~3);--tasks-file=FILE|read tasks from file;--json=BOOL=false|parse tasks as JSON (with -
+-tasks-file or STDIN)
+EXAMPLES: cliffy "list all Go files"|cliffy "analyze auth.go" "analyze db.go"|cliffy --context "You are a security expert" "review auth.go" "review db.go"|cliffy --context-file
+security-rules.md "review auth.go"|echo '["t1","t2"]' | cliffy --json -|cliffy --output-format json "list TODOs"|cliffy --verbose "task1" "task2"|cliffy --preset sec-review -
+-max-concurrent 2 "audit auth.go" "scan payments.go"
+RELATED: volley,doctor,init,preset.list,preset.show,preset.apply
+
+CMD: volley
+PURPOSE: Execute tasks with verbose progress and summary (alias for --verbose)
+INPUTS: ARGS(task1,task2,...)
+OUTPUTS: progress bars,results,summary
+SIDE_EFFECTS: network,optional writes via tools
+FLAGS: --output-format=STR=text|output format (text|json|diff);--context=STR|shared context;--context-file=FILE|shared context file;--preset=STR|preset id;--max-concurrent=INT=0|
+max workers
+EXAMPLES: cliffy volley "analyze auth.go" "analyze db.go"|cliffy --verbose "analyze auth.go" "analyze db.go"
+RELATED: exec
+
+CMD: doctor
+PURPOSE: Check configuration health (keys, providers, models, context files)
+INPUTS: none
+OUTPUTS: diagnostics and setup hints
+SIDE_EFFECTS: reads config files,tests provider connectivity
+FLAGS: none
+EXAMPLES: cliffy doctor
+RELATED: init
+
+CMD: init
+PURPOSE: Interactive wizard to create global config
+INPUTS: STDIN
+OUTPUTS: configuration written to ~/.config/cliffy/cliffy.json
+SIDE_EFFECTS: writes to ~/.config/cliffy/,may create ~/.config/cliffy/.cliffy
+FLAGS: none
+EXAMPLES: cliffy init
+RELATED: doctor
+
+CMD: preset.list
+PURPOSE: List all available presets grouped by category
+INPUTS: none
+OUTPUTS: preset identifiers and descriptions
+SIDE_EFFECTS: none
+FLAGS: none
+EXAMPLES: cliffy preset list
+RELATED: preset.show,preset.apply,exec
+
+CMD: preset.show
+PURPOSE: Show details for a preset
+INPUTS: ARGS(preset-id)
+OUTPUTS: preset configuration and examples
+SIDE_EFFECTS: none
+FLAGS: none
+EXAMPLES: cliffy preset show sec-review
+RELATED: preset.list,preset.apply,exec
+
+CMD: preset.apply
+PURPOSE: Apply a preset to project configuration
+INPUTS: ARGS(preset-id)
+OUTPUTS: writes updated config and summary of changes
+SIDE_EFFECTS: writes .cliffy/config.json in project
+FLAGS: none
+EXAMPLES: cliffy preset apply fast-qa
+RELATED: preset.list,preset.show,exec
+
+CMD: completion
+PURPOSE: Generate shell completion scripts
+INPUTS: ARGS(shell)
+OUTPUTS: completion script to stdout
+SIDE_EFFECTS: none (user typically redirects to a file)
+FLAGS: none
+EXAMPLES: cliffy completion bash|cliffy completion zsh|cliffy completion fish|cliffy completion powershell
+RELATED: exec
