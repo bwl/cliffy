@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	_ "github.com/joho/godotenv/autoload"
 
@@ -16,7 +17,6 @@ import (
 	"github.com/bwl/cliffy/internal/message"
 	"github.com/bwl/cliffy/internal/output"
 	"github.com/bwl/cliffy/internal/preset"
-	"github.com/bwl/cliffy/internal/runner"
 	"github.com/bwl/cliffy/internal/volley"
 	"github.com/spf13/cobra"
 )
@@ -24,23 +24,24 @@ import (
 const version = "0.1.0"
 
 var (
-	showThinking    bool
-	thinkingFormat  string
-	outputFormat    string
-	model           string
-	quiet           bool
-	fast            bool
-	smart           bool
-	showStats       bool
-	showVersion     bool
-	verbose         bool
-	sharedContext   string
-	contextFile     string
-	emitToolTrace   bool
-	presetID        string
-	maxConcurrent   int
-	tasksFile       string
-	tasksJSON       bool
+	showThinking   bool
+	thinkingFormat string
+	outputFormat   string
+	model          string
+	quiet          bool
+	fast           bool
+	smart          bool
+	showStats      bool
+	showVersion    bool
+	verbose        bool
+	sharedContext  string
+	contextFile    string
+	emitToolTrace  bool
+	presetID       string
+	maxConcurrent  int
+	tasksFile      string
+	tasksJSON      bool
+	taskTimeout    time.Duration
 )
 
 var rootCmd = &cobra.Command{
@@ -145,11 +146,7 @@ Built on Crush • https://cliffy.ettio.com`, tools.AsciiCliffy),
 			verbosity = config.VerbosityVerbose
 		}
 
-		// Route single tasks through runner for better streaming UX
-		// Route multiple tasks through volley for parallel execution
-		if len(tasks) == 1 {
-			return executeSingleTask(cmd, tasks[0], verbosity)
-		}
+		// Use volley path for both single and multiple tasks to keep behavior consistent
 		return executeVolley(cmd, tasks, verbosity)
 	},
 }
@@ -170,6 +167,7 @@ func init() {
 	rootCmd.Flags().BoolVar(&emitToolTrace, "emit-tool-trace", false, "Emit tool execution metadata as NDJSON to stderr for automation")
 	rootCmd.Flags().StringVarP(&presetID, "preset", "p", "", "Use a preset configuration (e.g., fast-qa, deep-review, sec-review)")
 	rootCmd.Flags().IntVar(&maxConcurrent, "max-concurrent", 0, "Maximum concurrent tasks (default: 3, use 0 for config default)")
+	rootCmd.Flags().DurationVar(&taskTimeout, "task-timeout", 0, "Per-task timeout (e.g. 60s, 2m). 0 disables")
 	rootCmd.Flags().StringVar(&tasksFile, "tasks-file", "", "Read tasks from file (line-separated or JSON with --json)")
 	rootCmd.Flags().BoolVar(&tasksJSON, "json", false, "Parse tasks as JSON array (use with --tasks-file or STDIN)")
 
@@ -184,7 +182,7 @@ func main() {
 	}
 }
 
-func executeVolley(cmd *cobra.Command, args []string, verbosity config.VerbosityLevel) error {
+func executeVolley(_ *cobra.Command, args []string, verbosity config.VerbosityLevel) error {
 	ctx := context.Background()
 
 	// Load config
@@ -228,6 +226,7 @@ func executeVolley(cmd *cobra.Command, args []string, verbosity config.Verbosity
 	opts.ThinkingFormat = thinkingFormat
 	opts.ShowStats = showStats
 	opts.EmitToolTrace = emitToolTrace
+	opts.TaskTimeout = taskTimeout
 
 	// Override max concurrent if specified (0 means use default)
 	if maxConcurrent > 0 {
@@ -263,6 +262,13 @@ func executeVolley(cmd *cobra.Command, args []string, verbosity config.Verbosity
 	// Validate that the selected model exists before creating agent
 	if err := validateModelExists(cfg, agentCfg.Model); err != nil {
 		return err
+	}
+
+	// Configure streaming output for text mode
+	if opts.OutputFormat == "text" {
+		streamer := newVolleyResultStreamer(opts, len(tasks))
+		opts.StreamResults = true
+		opts.ResultHandler = streamer.Handle
 	}
 
 	// Create agent
@@ -303,104 +309,12 @@ func executeVolley(cmd *cobra.Command, args []string, verbosity config.Verbosity
 	return nil
 }
 
-func executeSingleTask(cmd *cobra.Command, prompt string, verbosity config.VerbosityLevel) error {
-	ctx := context.Background()
-
-	// Load config
-	cwd, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("failed to get working directory: %w", err)
-	}
-
-	cfg, err := config.Init(cwd, ".cliffy", false)
-	if err != nil {
-		return fmt.Errorf("config load failed: %w", err)
-	}
-
-	// Get agent configuration
-	agentCfg, ok := cfg.Agents["coder"]
-	if !ok {
-		return fmt.Errorf("coder agent not found in config")
-	}
-
-	// Apply preset if specified (before other overrides)
-	if err := applyPresetToConfig(cfg, &agentCfg, presetID); err != nil {
-		return err
-	}
-
-	// Update the agent in config
-	cfg.Agents["coder"] = agentCfg
-
-	// Override model selection (takes precedence over preset)
-	if fast {
-		agentCfg.Model = config.SelectedModelTypeSmall
-	} else if smart {
-		agentCfg.Model = config.SelectedModelTypeLarge
-	} else if model != "" {
-		agentCfg.Model = config.SelectedModelType(model)
-	}
-
-	// Validate that the selected model exists before execution
-	if err := validateModelExists(cfg, agentCfg.Model); err != nil {
-		return err
-	}
-
-	// Load context from file if specified
-	taskContext := sharedContext
-	if contextFile != "" {
-		content, err := os.ReadFile(contextFile)
-		if err != nil {
-			return fmt.Errorf("failed to read context file: %w", err)
-		}
-		taskContext = string(content)
-	}
-
-	// Prepend context to prompt if provided
-	if taskContext != "" {
-		prompt = taskContext + "\n\n" + prompt
-	}
-
-	// Create runner options
-	opts := runner.Options{
-		ShowThinking:   showThinking || verbosity == config.VerbosityVerbose,
-		ThinkingFormat: thinkingFormat,
-		OutputFormat:   outputFormat,
-		Model:          model,
-		Quiet:          verbosity == config.VerbosityQuiet,
-		ShowStats:      showStats || verbosity == config.VerbosityVerbose,
-	}
-
-	// Override model selection (takes precedence over preset)
-	if fast {
-		opts.Model = "small"
-	} else if smart {
-		opts.Model = "large"
-	}
-
-	// Create runner
-	r, err := runner.New(cfg, opts)
-	if err != nil {
-		return fmt.Errorf("failed to create runner: %w", err)
-	}
-
-	// Execute the task
-	if err := r.Execute(ctx, prompt); err != nil {
-		return err
-	}
-
-	// Show stats if requested
-	if opts.ShowStats {
-		stats := r.GetStats()
-		fmt.Fprintf(os.Stderr, "\nStats: %d files read, %d files written, %d tool calls\n",
-			stats.FilesRead, stats.FilesWritten, stats.ToolCalls)
-		fmt.Fprintf(os.Stderr, "Tokens: %d input, %d output (%d total)\n",
-			stats.InputTokens, stats.OutputTokens, stats.InputTokens+stats.OutputTokens)
-	}
-
-	return nil
-}
-
 func outputVolleyResults(results []volley.TaskResult, summary volley.VolleySummary, opts volley.VolleyOptions) error {
+	// When streaming, results are already printed as they finish
+	if opts.StreamResults {
+		return nil
+	}
+
 	// Branch on output format
 	switch opts.OutputFormat {
 	case "json":
@@ -429,6 +343,47 @@ func outputVolleyResultsDiff(results []volley.TaskResult) error {
 	return nil
 }
 
+type volleyResultStreamer struct {
+	opts    volley.VolleyOptions
+	total   int
+	printed int
+}
+
+func newVolleyResultStreamer(opts volley.VolleyOptions, total int) *volleyResultStreamer {
+	return &volleyResultStreamer{
+		opts:  opts,
+		total: total,
+	}
+}
+
+// Handle streams a single task result as soon as it finishes
+func (s *volleyResultStreamer) Handle(result volley.TaskResult) {
+	if s.printed > 0 {
+		fmt.Println()
+	}
+
+	multiple := s.total > 1
+
+	if multiple {
+		statusIcon := "◍"
+		if result.Status == volley.TaskStatusFailed || result.Status == volley.TaskStatusCanceled {
+			statusIcon = "✗"
+		}
+		fmt.Printf("%s Task %d/%d: %s\n", statusIcon, result.Task.Index, s.total, truncatePrompt(result.Task.Prompt, 60))
+	}
+
+	if result.Status == volley.TaskStatusSuccess {
+		fmt.Println(result.Output)
+		if s.opts.Verbosity == config.VerbosityVerbose {
+			renderTaskStats(result)
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", result.Error)
+	}
+
+	s.printed++
+}
+
 // outputVolleyResultsText outputs results in human-readable text format
 func outputVolleyResultsText(results []volley.TaskResult, summary volley.VolleySummary, opts volley.VolleyOptions) error {
 	// If only one task, no need for separators
@@ -453,7 +408,7 @@ func outputVolleyResultsText(results []volley.TaskResult, summary volley.VolleyS
 			if opts.Verbosity == config.VerbosityVerbose {
 				renderTaskStats(result)
 			}
-		} else if result.Status == volley.TaskStatusFailed {
+		} else if result.Status == volley.TaskStatusFailed || result.Status == volley.TaskStatusCanceled {
 			// Show error for failed tasks - always visible, even in quiet mode
 			fmt.Fprintf(os.Stderr, "Error: %v\n", result.Error)
 		}
@@ -512,7 +467,6 @@ func printVersion() {
 	fmt.Println("Built on Crush • Powered by OpenRouter")
 	fmt.Printf("\n%s  Ready to help\n", tools.AsciiCliffy)
 }
-
 
 // newCompletionCmd creates the completion command with subcommands for each shell
 func newCompletionCmd() *cobra.Command {
