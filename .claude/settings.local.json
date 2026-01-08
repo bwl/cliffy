@@ -9,7 +9,8 @@
       "WebFetch(domain:github.com)",
       "Bash(task:*)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(wc:*)"
     ],
     "deny": [],
     "ask": []
